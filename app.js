@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const mysql = require('mysql2');
+const bodyParser = require('body-parser');
 require('dotenv').config();
 
 const app = express();
@@ -20,6 +21,9 @@ connection.connect(err => {
     if (err) throw err;
     console.log('Connected to MySQL database.');
 });
+
+// Use body-parser to parse JSON requests
+app.use(bodyParser.json());
 
 // Function to initiate call using GET request
 async function initiateCall(agent, clientPhone) {
@@ -42,11 +46,13 @@ async function checkCallStatus(extension, clientPhone) {
 
         let extensionConnected = false;
         let clientConnected = false;
+        let callid = "";
 
         activeCalls.forEach(call => {
             call.AConnList.forEach(conn => {
                 if (conn.dnNum === extension && conn.status === 'Connected') {
                     extensionConnected = true;
+                    callid = call.callID;
                 }
                 if (conn.externalParty === clientPhone && conn.status === 'Connected') {
                     clientConnected = true;
@@ -54,7 +60,7 @@ async function checkCallStatus(extension, clientPhone) {
             });
         });
 
-        return { extensionConnected, clientConnected };
+        return { extensionConnected, clientConnected, callid };
     } catch (error) {
         console.error('Error checking call status:', error);
         return { extensionConnected: false, clientConnected: false };
@@ -62,9 +68,9 @@ async function checkCallStatus(extension, clientPhone) {
 }
 
 // Function to log call attempts
-function logCallAttempt(clientPhone, userExtension, companyId, status) {
-    const query = `INSERT INTO call_logs (client_phone, user_extension, company_id, call_status) VALUES (?, ?, ?, ?)`;
-    connection.query(query, [clientPhone, userExtension, companyId, status], (err, results) => {
+function logCallAttempt(clientPhone, userExtension, companyId, status, callid,attempt) {
+    const query = `INSERT INTO call_logs (client_phone, user_extension, company_id, call_status, callid,attempt) VALUES (?, ?, ?, ?, ?,?)`;
+    connection.query(query, [clientPhone, userExtension, companyId, status, callid,attempt], (err, results) => {
         if (err) {
             console.error('Failed to log call attempt:', err);
         } else {
@@ -95,15 +101,18 @@ async function handleCall(clientPhone, userExtensions, companyId, endpointLoop) 
                 console.log(`Call initiation in progress from extension ${extension} to client ${clientPhone}`);
 
                 let bothConnected = false;
+                let lastStatusResponse = null;
 
                 for (let j = 0; j < 20; j++) { // Polling for up to 20 seconds (20 iterations with 1 second interval)
                     const status = await checkCallStatus(extension.trim(), clientPhone);
                     console.log(`Status check ${j + 1}: ${JSON.stringify(status)}`);
+                    var atmpt=j;
+                    lastStatusResponse = status.response;
 
                     if (status.extensionConnected) {
-                        logCallAttempt(clientPhone, extension.trim(), companyId, 'connected');
+                        logCallAttempt(clientPhone, extension.trim(), companyId, 'connected', status.callid,atmpt);
                         console.log(`Extension ${extension} is connected. Sending data to webhook and stopping further calls.`);
-                        const data = { clientPhone, userExtension: extension.trim(), companyId, status };
+                        const data = { clientPhone, userExtension: extension.trim(), companyId, status, lastStatusResponse };
                         await sendDataToWebhook(data);
                         console.log('Data sent to webhook.');
                         return; // Stop further calls
@@ -126,22 +135,84 @@ async function handleCall(clientPhone, userExtensions, companyId, endpointLoop) 
     console.log('Failed to connect the call with all provided extensions.');
 }
 
-// GET endpoint
-app.get('/initiate-call', async (req, res) => {
+
+
+// GET endpoint for initiating calls
+app.get('/initiate-call', (req, res) => {
     const { clientPhone, userExtensions, companyId, endpointLoop } = req.query;
 
     if (!clientPhone || !userExtensions || !companyId || !endpointLoop) {
         return res.status(400).send('Missing required parameters.');
     }
 
-    try {
-        await handleCall(clientPhone, userExtensions, companyId, parseInt(endpointLoop));
-        res.status(200).send('Call process initiated.');
-    } catch (error) {
-        console.error('Error initiating call process:', error);
-        res.status(500).send('Error initiating call process.');
-    }
+    // Immediately send response and handle the call process in the background
+    res.status(200).send('Call process initiated.');
+
+    // Run handleCall asynchronously
+    setImmediate(async () => {
+        try {
+            await handleCall(clientPhone, userExtensions, companyId, parseInt(endpointLoop));
+        } catch (error) {
+            console.error('Error initiating call process:', error);
+        }
+    });
 });
+
+
+
+
+
+// GET endpoint to fetch and format timestamp
+app.get('/format-timestamp', async (req, res) => {
+    const { id } = req.query;  // expecting the record ID as a query parameter
+
+    if (!id) {
+        return res.status(400).send('Missing required parameter: Call id that means your call is failed.');
+    }
+
+    const query = 'SELECT timestamp, attempt,callid FROM call_logs WHERE callid = ?';
+
+    connection.query(query, [id], (err, results) => {
+        if (err) {
+            console.error('Error fetching timestamp:', err);
+            return res.status(500).send('Error fetching timestamp.');
+        }
+
+        if (results.length === 0) {
+            return res.status(404).send('Record not found.');
+        }
+
+        const { timestamp, attempt,callid } = results[0];
+
+        // Calculate new timestamp by subtracting seconds
+        const adjustedTimestamp = new Date(timestamp.getTime() - attempt * 1000);
+
+        // Format new timestamp as 'YYMMDDHHmmss'
+        const formattedTimestamp = [
+            adjustedTimestamp.getFullYear().toString().slice(2),
+            ('0' + (adjustedTimestamp.getMonth() + 1)).slice(-2),
+            ('0' + adjustedTimestamp.getDate()).slice(-2),
+            ('0' + adjustedTimestamp.getHours()).slice(-2),
+            ('0' + adjustedTimestamp.getMinutes()).slice(-2),
+            ('0' + adjustedTimestamp.getSeconds()).slice(-2)
+        ].join('');
+if(attempt<=20)
+    {
+            // Construct the URL for the MP3 recording
+            const recordingUrl = `https://ebmsdxb.3cx.ae:3081/webapi/recording/${formattedTimestamp}_${callid}-1-1.mp3`;
+
+            // Send JSON response with the recording URL
+            res.status(200).json({ recordingUrl });
+        //res.status(200).send("https://ebmsdxb.3cx.ae:3081/webapi/recording/"+formattedTimestamp+"_"+callid+"-1-1.mp3");
+}
+else{
+    res.status(200).send("No Recording found Client didn't pick the call");
+
+}
+    });
+});
+
+
 
 app.listen(port, () => {
     console.log(`Server running on port ${port}`);
